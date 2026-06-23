@@ -1,0 +1,11 @@
+# Minimal sshd config for the SEV-SNP MPI worker.
+# Root logs in with the master's public key only (PRRTE 'plm ssh').
+Port 22
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthorizedKeysFile .ssh/authorized_keys
+# Allow the master to forward PATH/LD_LIBRARY_PATH for prted
+AcceptEnv LANG LC_* PATH LD_LIBRARY_PATH
+PrintMotd no

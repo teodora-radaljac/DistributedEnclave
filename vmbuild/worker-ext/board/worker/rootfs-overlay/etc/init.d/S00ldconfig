@@ -1,0 +1,14 @@
+#!/bin/sh
+# Make /root/mpi-stack/lib resolvable for non-login shells (e.g. prted launched
+# over ssh by the master's PRRTE DVM). /etc/ld.so.conf is generated at RUNTIME
+# (the initramfs rootfs is writable) to avoid Buildroot's build-time sanity
+# check that forbids a static /etc/ld.so.conf{,.d} in the target tree.
+case "$1" in
+    start|"")
+        echo /root/mpi-stack/lib > /etc/ld.so.conf
+        /sbin/ldconfig 2>/dev/null || true
+        ;;
+    stop|restart|reload)
+        ;;
+esac
+exit 0

@@ -1,0 +1,23 @@
+#!/bin/sh
+# TEMP boot-time self-test: validate that the OpenMPI/worker libraries resolve
+# and snpguest runs. Prints to the console (captured via serial). Remove for
+# production. Runs after S00ldconfig (which builds the ld cache for
+# /root/mpi-stack/lib).
+case "$1" in
+    start|"")
+        echo "===================== WORKER SELFTEST ====================="
+        echo "[hostname] $(hostname)   [ip] $(ip -o -4 addr show 2>/dev/null | awk '{print $2\"=\"$4}' | tr '\n' ' ')"
+        echo "--- worker_npb shared libs (LD_TRACE) ---"
+        LD_TRACE_LOADED_OBJECTS=1 /root/src/worker_npb 2>&1
+        echo "--- worker_npb shared libs WITH LD_LIBRARY_PATH (as prte --prefix sets) ---"
+        LD_LIBRARY_PATH=/root/mpi-stack/lib LD_TRACE_LOADED_OBJECTS=1 /root/src/worker_npb 2>&1
+        echo "--- prted shared libs (LD_TRACE) ---"
+        LD_TRACE_LOADED_OBJECTS=1 /root/mpi-stack/bin/prted 2>&1
+        echo "--- snpguest --version ---"
+        /usr/bin/snpguest --version 2>&1
+        echo "--- /dev/sev-guest ---"
+        ls -l /dev/sev-guest 2>&1 || echo "no /dev/sev-guest (expected without SEV)"
+        echo "===================== SELFTEST DONE ======================="
+        ;;
+esac
+exit 0

@@ -1,0 +1,2 @@
+# No custom packages: the OpenMPI stack and worker binaries are provided
+# pre-built via the rootfs overlay (board/worker/rootfs-overlay).
