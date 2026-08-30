@@ -1,0 +1,2 @@
+name: FORT
+desc: External buildroot tree with a linux build for AMD SEV-SNP with Ray

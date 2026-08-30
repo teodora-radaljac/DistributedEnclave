@@ -1,0 +1,5 @@
+config BR2_PACKAGE_FORT_CLIENT
+	bool "fort-client"
+	depends on BR2_PACKAGE_HOST_GO_TARGET_ARCH_SUPPORTS
+	help
+	  Fort ATLS client executable.

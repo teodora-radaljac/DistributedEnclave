@@ -1,0 +1,2 @@
+source "$BR2_EXTERNAL_FORT_PATH/package/fort-client/Config.in"
+source "$BR2_EXTERNAL_FORT_PATH/package/python-ray/Config.in"

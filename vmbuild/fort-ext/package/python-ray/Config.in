@@ -1,0 +1,6 @@
+config BR2_PACKAGE_PYTHON_RAY
+	bool "python-ray"
+	depends on BR2_PACKAGE_PYTHON3
+	help
+	  Pre-installs Ray, scipy and numpy wheels into the target rootfs
+	  at build time so the CVM does not need to run pip at boot.
