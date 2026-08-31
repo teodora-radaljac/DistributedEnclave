@@ -1,0 +1,14 @@
+[Unit]
+Description=Fort ATLS client — attestation and Ray TLS cert issuance
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/root/network_up.sh
+ExecStart=/usr/bin/client
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
