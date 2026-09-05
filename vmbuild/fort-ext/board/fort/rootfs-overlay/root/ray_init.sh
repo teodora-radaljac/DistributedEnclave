@@ -44,10 +44,13 @@ export RAY_TLS_SERVER_KEY=/root/ray-worker.key
 export RAY_TLS_CA_CERT=/root/ca.crt
 export RAY_raylet_start_wait_time_s=300
 
-# ray_object_store_mb in the kernel cmdline overrides the default 200 MB.
+# ray_object_store_mb in the kernel cmdline overrides Ray's default (30% of RAM).
 OBJ_STORE_MB=$(cmdline_param ray_object_store_mb)
-OBJ_STORE_MB=${OBJ_STORE_MB:-200}
-OBJ_STORE_BYTES=$((OBJ_STORE_MB * 1024 * 1024))
+if [ -n "$OBJ_STORE_MB" ]; then
+    OBJ_STORE_ARG="--object-store-memory=$((OBJ_STORE_MB * 1024 * 1024))"
+else
+    OBJ_STORE_ARG=""
+fi
 
 ray start \
     --address="${HEAD_IP}:${RAY_HEAD_PORT}" \
@@ -55,7 +58,7 @@ ray start \
     --node-manager-port="${NODE_MANAGER_PORT}" \
     --object-manager-port="${OBJECT_MANAGER_PORT}" \
     --num-cpus="$(nproc)" \
-    --object-store-memory="${OBJ_STORE_BYTES}" || true
+    ${OBJ_STORE_ARG} || true
 
 echo "=== ray start failed — dumping internal logs ==="
 LOG_DIR=$(ls -dt /tmp/ray/session_*/logs 2>/dev/null | head -1)

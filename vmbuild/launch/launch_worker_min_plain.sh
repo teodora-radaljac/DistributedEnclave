@@ -23,8 +23,14 @@ MEM="${MEM:-1G}"
 SMP="${SMP:-1}"
 QEMU_BIN="qemu-system-x86_64"
 OVMF="${OVMF:-/usr/share/ovmf/OVMF.fd}"
-KERNEL="${KERNEL:-/home/teodora/br/buildroot/output/images/bzImage}"
-INITRD="${INITRD:-/home/teodora/br/buildroot/output/images/rootfs.cpio.gz}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Buildroot tree lives beside the repo; override BR_ROOT (or KERNEL/INITRD
+# directly) if it is elsewhere.  Matches the convention in launch-fort-sev.sh.
+BR_ROOT="${BR_ROOT:-$REPO_ROOT/../buildroot}"
+[ -d "$BR_ROOT" ] || BR_ROOT="$REPO_ROOT/../../buildroot"   # nested checkout
+KERNEL="${KERNEL:-$BR_ROOT/output/images/bzImage}"
+INITRD="${INITRD:-$BR_ROOT/output/images/rootfs.cpio.gz}"
 
 sudo $QEMU_BIN \
     -enable-kvm -cpu EPYC-v4 \

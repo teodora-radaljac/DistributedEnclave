@@ -45,7 +45,7 @@ bash ~/setup_network.sh
 
 ### Korak 3 — Pokretanje sve tri VM (jedna sudo lozinka)
 ```bash
-sudo bash -c 'cd /home/teodora; for v in master worker1 worker2; do screen -dmS $v bash launch_$v.sh; done; sleep 3; screen -ls'
+sudo bash -c 'cd "${VM_DIR:-$HOME}"; for v in master worker1 worker2; do screen -dmS $v bash launch_$v.sh; done; sleep 3; screen -ls'
 ```
 > Treba da prikaže tri `screen` sesije: `master`, `worker1`, `worker2`.
 > Ceo blok se izvršava kao root da interni `sudo qemu` ne bi tražio lozinku ponovo.

@@ -7,7 +7,8 @@
 # worker hostnames work unchanged.
 QEMU_BIN="qemu-system-x86_64"
 OVMF="/usr/share/ovmf/OVMF.fd"
-DISK="/home/teodora/images/master.qcow2"
+DISK="${DISK:-$HOME/images/master.qcow2}"
+LOGDIR="${LOGDIR:-$HOME/logs}"
 TAP="tap0"
 MAC="52:55:00:d1:55:01"
 sudo nohup setsid "$QEMU_BIN" \
@@ -21,6 +22,6 @@ sudo nohup setsid "$QEMU_BIN" \
     -netdev tap,id=vmnic,ifname=$TAP,script=no,downscript=no \
     -device virtio-net-pci,disable-legacy=on,iommu_platform=true,netdev=vmnic,mac=$MAC,romfile= \
     -nographic -monitor unix:monitor-master-plain,server,nowait \
-    >/home/teodora/logs/master_plain.log 2>&1 </dev/null &
+    >"$LOGDIR/master_plain.log" 2>&1 </dev/null &
 disown 2>/dev/null || true
 echo "PLAIN master launched (tap0, 192.168.100.2, no SEV)"

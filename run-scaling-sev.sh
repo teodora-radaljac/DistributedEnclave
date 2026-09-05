@@ -11,6 +11,9 @@
 #   cg-only    – pass literal "cg-only" to skip EP and DGEMM
 #   CG_CLASSES – comma-separated classes e.g. "B,C"
 #
+# Env:
+#   WORKLOADS  – optional subset, e.g. WORKLOADS=STREAM to validate one kernel
+#
 # Prerequisites:
 #   1. Bridge/tap interfaces:  sudo ./vmbuild/launch/setup-bridge.sh WORKERS
 #   2. sudo pre-authenticated: sudo -v
@@ -115,6 +118,7 @@ python "$SCRIPT_DIR/analysis/bench_ray.py" \
     --runs    "$RUNS" \
     --timeout 600 \
     --csv     "$CSV" \
+    ${WORKLOADS:+--workloads "$WORKLOADS"} \
     ${CG_ONLY:+--cg-only} \
     ${CG_CLASSES:+--cg-classes "$CG_CLASSES"}
 

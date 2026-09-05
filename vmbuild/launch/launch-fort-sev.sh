@@ -23,7 +23,7 @@ TAP_IF="tap$((WORKER_ID - 1))"
 NODE_MGR_PORT=$((6380 + 2 * WORKER_ID - 1))
 OBJ_MGR_PORT=$((6380 + 2 * WORKER_ID))
 MONITOR_SOCK="monitor-worker-${WORKER_ID}"
-MEM="2G"
+MEM="3G"
 
 CORE_START=$((WORKER_ID - 1))
 sudo taskset -c "${CORE_START},$((CORE_START + 16))" $QEMU_BIN \
@@ -32,7 +32,7 @@ sudo taskset -c "${CORE_START},$((CORE_START + 16))" $QEMU_BIN \
     -machine q35,confidential-guest-support=sev0,memory-backend=ram1 \
     -smp 1,sockets=1,threads=1 \
     -m ${MEM},slots=5,maxmem=40G \
-    -object memory-backend-memfd,id=ram1,size=${MEM},share=true,prealloc=false,reserve=false \
+    -object memory-backend-memfd,id=ram1,size=${MEM},share=true,prealloc=true,reserve=true \
     -object sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1,kernel-hashes=on \
     -bios $OVMF \
     -kernel "$KERNEL" \
