@@ -50,6 +50,7 @@ vmbuild/
     setup-bridge.sh / teardown-bridge.sh
   refresh-server-cert.sh   Regenerate ATLS server cert and rebuild Ray worker image
   assemble_overlay.sh      Pull MPI stack from master VM into the worker overlay
+run-both-campaigns.sh   Both Ray campaigns back-to-back (preferred entry point)
 run-scaling-sev.sh      Full SEV-SNP Ray scaling study (host entry point)
 run-scaling-nosnp.sh    Full plain-VM Ray scaling study (host entry point)
 RUNBOOK.md              Operational runbook — MPI cluster setup and benchmark procedure
@@ -160,13 +161,13 @@ cd fort/server && go build -o server . && cd -
 # Pre-authenticate sudo (workers need it for QEMU + KVM)
 sudo -v
 
-# SEV-SNP run
-./run-scaling-sev.sh 13 100
-# results-scaling/scaling-sev-YYYYMMDD-HHMMSS.csv
+# Both campaigns back-to-back (recommended)
+export FORT_OVMF_PATH=/path/to/OVMF.amdsev.fd
+./run-both-campaigns.sh 13 10
 
-# Plain-VM run (no SEV, for comparison)
-./run-scaling-nosnp.sh 13 100
-# results-scaling/scaling-nosnp-YYYYMMDD-HHMMSS.csv
+# ...or one configuration at a time
+./run-scaling-sev.sh 13 10      # results-scaling/scaling-sev-YYYYMMDD-HHMMSS.csv
+./run-scaling-nosnp.sh 13 10    # results-scaling/scaling-nosnp-YYYYMMDD-HHMMSS.csv
 ```
 
 `run-scaling-sev.sh` starts the ATLS server, starts the Ray head, launches all
@@ -176,7 +177,49 @@ Ctrl+C stops everything cleanly.
 To run only NAS CG with a larger working set:
 
 ```sh
-./run-scaling-sev.sh 13 100 1 cg-only "B,C"
+./run-scaling-sev.sh 13 10 1 cg-only "B,C"
+```
+
+### Running both campaigns
+
+`run-both-campaigns.sh` runs the SEV-SNP and plain-VM campaigns one after the
+other in a single sitting. Prefer it over invoking the two scripts by hand:
+
+- **Back-to-back ordering.** Within a campaign the run-to-run CV is ~0.5%, but
+  campaigns started hours apart have drifted by ~10% — larger than the SEV-SNP
+  effect being measured. Running them together keeps host conditions close.
+- **Unattended sudo.** VMs are booted with `sudo qemu-system-x86_64` and torn
+  down with `sudo pkill`, but sudo's timestamp expires after ~15 min and the
+  second campaign starts well over an hour in. The script authenticates once and
+  refreshes in the background until it exits.
+- **Independent phases.** A failure in the first campaign does not prevent the
+  second from running; each phase's status and CSV path are reported at the end
+  and written to `results-scaling/campaign-YYYYMMDD-HHMMSS.log`. The script exits
+  non-zero if either phase failed.
+
+```sh
+./run-both-campaigns.sh [WORKERS [RUNS]]      # defaults: 13 workers, 10 runs
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FORT_OVMF_PATH` | *(required)* | AMD SEV OVMF binary; validated before the sudo prompt |
+| `WORKLOADS` | all | Subset to run, e.g. `WORKLOADS=STREAM,CG` |
+| `CG_CLASSES` | `A` | NAS CG classes, e.g. `CG_CLASSES=C` |
+| `ORDER` | `sev-first` | `sev-first` or `plain-first` — which campaign runs first |
+| `SKIP_SEV` | *(unset)* | Set to `1` to run only the plain campaign |
+| `SKIP_PLAIN` | *(unset)* | Set to `1` to run only the SEV campaign |
+
+Whichever configuration runs second measures slightly slower, which biases the
+reported penalty. `ORDER=plain-first` reverses the sequence, so measuring a pair
+both ways brackets the effect:
+
+```sh
+# validate one workload cheaply before committing to a full pair
+WORKLOADS=STREAM ./run-both-campaigns.sh 13 3
+
+# same pair with the campaign order reversed, to quantify order bias
+ORDER=plain-first ./run-both-campaigns.sh 13 10
 ```
 
 ### Environment overrides (Ray stack)

@@ -11,18 +11,22 @@
 #
 # Usage:  NWORKERS=10 MEM=3G bash start_min_cluster.sh
 set -u
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+BR_ROOT="${BR_ROOT:-$REPO_ROOT/../buildroot}"
+[ -d "$BR_ROOT" ] || BR_ROOT="$REPO_ROOT/../../buildroot"   # nested checkout
 NWORKERS="${NWORKERS:-2}"
 MEM="${MEM:-4G}"
-mkdir -p "$HOME/logs/qemu_logs_min"
-echo "=== sudo (kucajte lozinku ako se trazi) ==="
-sudo env MEM="$MEM" NWORKERS="$NWORKERS" bash -c '
-LOGDIR=/home/teodora/logs/qemu_logs_min
+LOGDIR="${LOGDIR:-$HOME/logs/qemu_logs_min}"
 mkdir -p "$LOGDIR"
-scr=/home/teodora/launch/launch_worker_min.sh
+echo "=== sudo (kucajte lozinku ako se trazi) ==="
+sudo env MEM="$MEM" NWORKERS="$NWORKERS" LOGDIR="$LOGDIR" \
+     BR_ROOT="$BR_ROOT" scr="$SCRIPT_DIR/launch_worker_min.sh" bash -c '
+mkdir -p "$LOGDIR"
 sed "s/^sudo //" "$scr" > /tmp/minrun_worker.sh
 for N in $(seq 1 "$NWORKERS"); do
   echo "--- worker${N} (MEM=$MEM) ---"
-  setsid bash /tmp/minrun_worker.sh "$N" </dev/null >"$LOGDIR/qemu_worker${N}.log" 2>&1 &
+  BR_ROOT="$BR_ROOT" setsid bash /tmp/minrun_worker.sh "$N" </dev/null >"$LOGDIR/qemu_worker${N}.log" 2>&1 &
   sleep 1
 done
 sleep 4

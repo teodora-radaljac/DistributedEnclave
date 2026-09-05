@@ -1,59 +1,66 @@
 #!/usr/bin/env python3
 """
-bench_ray.py – six-metric CVM Ray worker benchmark.
-
-Metrics
--------
-  1  enrollment_ms  – ray.init() → worker node appears in ray.nodes()
-  2  t_round_ms     – remote_fn.remote() → ray.get() wall time
-  3  t_compute_ms   – worker-side compute only (self-reported via perf_counter)
-  4  t_scatter_ms   – ray.put() of task inputs on the head
-  5  t_gather_ms    – t_round − t_compute  (queue + object fetch + return path)
-  6  throughput     – GFLOPS for DGEMM, Mop/s for EP and CG
+bench_ray.py – Ray CVM benchmark suite matching the OpenMPI campaign.
 
 Workloads
 ---------
-  DGEMM   N = 512, 1024, 2048          2·N³ FLOPs
-  EP      pairs = 2²⁴, 2²⁶, 2²⁸       1 op/pair
-  CG      Class S (N=1 400)
-          Class W (N=7 000)
-          Class A (N=14 000)            2·nnz·iters ops
+  DGEMM   M=2048 (N=1,2,4,8)  M=4096 (N=1,2,4,8)  M=6144 (N=4,8)
+          Strong scaling: head scatters A-blocks + full B, workers return C-blocks.
+  EP      2^28 pairs per worker (weak scaling, N=1..13)
+  STREAM  128 MiB/array × 3 arrays per worker (weak scaling, N=1..13)
+          Triad: A = B + alpha*C; 2 warm-up passes, then all N workers
+          rendezvous on a barrier and sustain Triads for a fixed 2 s window
+          so the timed regions provably overlap (see STREAM_MEASURE_SECONDS).
+  RANDOM  256 MiB int32 permutation per worker (weak scaling, N=1..13)
+          50 M timed dependent pointer-chase accesses per worker.
+  CG      NAS Class S/W/A/B/C (strong scaling)
 
-Speedup / efficiency (metric from the spec)
--------------------------------------------
-  Requires multiple worker nodes. Run with --workers N after starting N CVMs.
-  S(N) = T(1) / T(N),   E(N) = S(N) / N
-  When --workers 1 (default) this section is skipped.
+Metrics
+-------
+  DGEMM   GFLOP/s (aggregate)
+  EP      Mop/s   (aggregate pairs/s)
+  STREAM  GiB/s   (aggregate read+write bandwidth)
+  RANDOM  ns/access (slowest worker latency)
+  CG      Mop/s   (aggregate)
 
-Usage
------
-  # Start Ray head on host
-  ray start --head --port=6379
+All timings use the slowest-worker compute interval as t_compute_max,
+matching the MPI campaign's t_compute_max_ms column.
+Enrollment is measured separately and excluded from workload timers.
 
-  # Boot one or more CVMs, then:
-  python bench_ray.py [--repeat N] [--timeout SEC] [--workers N] [--csv FILE]
+Usage (scaling study)
+---------------------
+  ray start --head --port=6379 --num-cpus=0
+  python bench_ray.py --scaling 1,2,...,13 --runs 10 --csv out.csv
 """
 
 import argparse
 import csv
-import statistics
+import os
 import sys
 import time
-from dataclasses import dataclass, fields
 
 import numpy as np
 import ray
-from ray.util.placement_group import placement_group, remove_placement_group
-from ray.util.scheduling_strategies import (
-    PlacementGroupSchedulingStrategy,
-    NodeAffinitySchedulingStrategy,
-)
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 
 # ---------------------------------------------------------------------------
-# NAS benchmark parameters
+# Workload parameters
 # ---------------------------------------------------------------------------
 
+# DGEMM: matrix_size → list of valid worker counts.
+# M=6144, N=1/2 excluded: B alone is 288 MiB; MPI campaign constraint kept.
+DGEMM_CONFIGS = {
+    2048: [1, 2, 4, 8],
+    4096: [1, 2, 4, 8],
+    6144: [4, 8],
+}
+
+# EP: only 2^28 for paper parity with MPI campaign.
+EP_PAIRS = [1 << 28]
+EP_BATCH = 1 << 19   # 512 K pairs/chunk to avoid OOM on 2 GiB workers
+
+# NAS CG classes
 CG_CLASSES = {
     "S": dict(n=1_400,   nz=7,  niter=15,  shift=10),
     "W": dict(n=7_000,   nz=8,  niter=15,  shift=12),
@@ -61,74 +68,134 @@ CG_CLASSES = {
     "B": dict(n=75_000,  nz=13, niter=75,  shift=60),
     "C": dict(n=150_000, nz=15, niter=75,  shift=110),
 }
-DGEMM_SIZES = [512, 1024, 2048]
-EP_PAIRS    = [1 << 24, 1 << 26, 1 << 28]
-EP_BATCH    = 1 << 19   # 512 K pairs per chunk (~8 MB peak) to fit in constrained VMs
+# One SpMV over a single worker's row block is microseconds of work, while a
+# Ray actor call costs milliseconds.  Timing one multiply therefore measures
+# the per-call noise floor: the old code reported 8-44 ms for a ~12 k-nonzero
+# block and, worse, the value *grew* with N even though the block shrinks.
+# (MPI's CG shows the correct behaviour, falling from 2.18 ms at N=1 to
+# 0.24 ms at N=10.)  Repeating the multiply inside the timer and dividing
+# lifts the kernel above that floor without altering the algorithm or the
+# communication pattern.
+#
+# The count is chosen adaptively from a warm-up multiply so that the timed
+# loop lasts about CG_SPMV_TARGET_MS regardless of class and worker count.
+# A fixed count cannot serve both ends: class A at N=13 is ~1.8 ms per
+# multiply (wants many reps) while class C at N=1 is ~44 ms (where 50 reps
+# would cost 165 s per run).
+CG_SPMV_TARGET_MS = 100.0
+CG_SPMV_MIN_REPS  = 2
+CG_SPMV_MAX_REPS  = 200
 
+# STREAM Triad: A = B + alpha*C
+STREAM_ARRAY_BYTES = 128 * 1024 * 1024        # 128 MiB per array
+STREAM_ARRAY_ELEMS = STREAM_ARRAY_BYTES // 8  # float64 elements
+STREAM_ALPHA       = 1.0
+STREAM_WARMUP      = 2                         # warm-up passes before the barrier
+# A single Triad pass over 128 MiB takes ~29 ms, but a Ray round costs
+# 200-1000 ms of dispatch/collect overhead.  A one-shot timed pass therefore
+# lands at a random offset inside the round, so the N workers' timed windows
+# do not reliably overlap and the "aggregate" bandwidth measures nothing.
+# Fix: barrier-synchronise all workers, then sustain Triads for a fixed
+# wall-clock window so every worker is hammering memory at the same time.
+STREAM_MEASURE_SECONDS = 2.0
+# The Triad must move exactly 3 arrays' worth of DRAM traffic (read B, read C,
+# write A) for the reported byte count to be honest.  Expressed as two whole-
+# array numpy calls it moves 5: the 128 MiB intermediate A is written by the
+# multiply, then re-read by the add, and at 128 MiB against a 32 MiB LLC it
+# cannot stay cached.  Running the pair over chunks small enough that the
+# intermediate stays LLC-resident restores true 3-array traffic (measured:
+# 15.39 -> 18.68 GiB/s single-core, matching the MPI C kernel's 17.60).
+# 512 Ki float64 = 4 MiB per array, so B/C/A chunks together are 12 MiB.
+STREAM_CHUNK_ELEMS = 512 * 1024
 
-# ---------------------------------------------------------------------------
-# Result
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Result:
-    workload:      str
-    size:          str
-    t_scatter_ms:  float
-    t_round_ms:    float
-    t_compute_ms:  float
-    t_gather_ms:   float
-    throughput:    float
-    unit:          str   # "GFLOPS" or "Mop/s"
+# RANDOM pointer chasing
+RANDOM_ARRAY_BYTES = 256 * 1024 * 1024        # 256 MiB per worker
+RANDOM_ARRAY_ELEMS = RANDOM_ARRAY_BYTES // 4  # int32 indices
+RANDOM_WARMUP      = 5_000_000                # dependent accesses (outside timer)
+RANDOM_MEASURED    = 50_000_000               # timed dependent accesses
 
 
 # ---------------------------------------------------------------------------
 # Remote workloads
 # ---------------------------------------------------------------------------
 
-@ray.remote
-def remote_dgemm(A, B):
-    """C = A @ B.  Returns (t_compute_s, flops)."""
-    import time
-    import numpy as np
-    t0 = time.perf_counter()
-    C = np.matmul(A, B)
-    t = time.perf_counter() - t0
-    _ = float(C[0, 0])          # prevent dead-code elimination
-    return t, 2 * A.shape[0] ** 3
+@ray.remote(num_cpus=0)
+class DGEMMWorker:
+    """Persistent actor for proper scatter / compute / gather phase separation.
 
+    One actor per worker node, pinned via NodeAffinitySchedulingStrategy.
+    Protocol per run:
+      1. head calls load(A_block, B) — data travels over the network to this node;
+         ray.get() on the ack means the inputs are local when the call returns.
+      2. head calls compute() — actor runs matmul locally and returns C_block;
+         ray.get() on the result measures compute + result transfer back to head.
 
-@ray.remote
-def remote_dgemm_block(A_block, B):
-    """Strong-scaling DGEMM: compute C_block = A_block @ B and return it.
-    Returning C_block forces the gather transfer, matching MPI's MPI_Recv of C."""
-    import time
-    import numpy as np
-    t0 = time.perf_counter()
-    C_block = np.matmul(A_block, B)
-    t = time.perf_counter() - t0
-    flops = 2 * A_block.shape[0] * A_block.shape[1] * B.shape[1]
-    return t, flops, C_block
+    This gives:  scatter_ms  = true network delivery of inputs (load ack)
+                 round_ms    = compute + gather (compute() return)
+                 noncompute_ms = round_ms - compute_max_ms ≈ gather transfer
+    """
+
+    def __init__(self):
+        import os, ctypes
+        for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                   "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ[_v] = "1"
+        try:
+            _lib = ctypes.cdll.LoadLibrary("libopenblas.so")
+            _lib.openblas_set_num_threads(1)
+            _lib.openblas_get_num_threads.restype = ctypes.c_int
+            _actual = _lib.openblas_get_num_threads()
+            if _actual != 1:
+                import sys
+                print(f"[warn] DGEMMWorker: BLAS still using {_actual} threads",
+                      file=sys.stderr)
+        except Exception:
+            pass
+        self._A_block = None
+        self._B = None
+
+    def ready(self):
+        return True
+
+    def load(self, A_block, B):
+        """Receive and store input matrices; returns True when data is local.
+
+        Old arrays are explicitly released before new copies are made so that
+        old-B (288 MiB for M=6144) is freed before new-B is allocated.
+        Without this, old-B + new-B + plasma-B overlap in memory, pushing
+        peak usage above the 2 GiB worker limit.
+        np.array() forces process-heap allocation, releasing plasma refs when
+        load() returns so plasma holds at most one A_block+B pair at a time."""
+        import numpy as np
+        self._A_block = None   # free old 72 MiB before new allocation
+        self._B = None         # free old 288 MiB before new allocation
+        self._A_block = np.array(A_block)
+        self._B = np.array(B)
+        return True
+
+    def compute(self):
+        """Execute C_block = A_block @ B. Returns (t_s, flops, C_block)."""
+        import time, numpy as np
+        t0 = time.perf_counter()
+        C_block = np.matmul(self._A_block, self._B)
+        t = time.perf_counter() - t0
+        flops = 2 * self._A_block.shape[0] * self._A_block.shape[1] * self._B.shape[1]
+        return t, flops, C_block
 
 
 @ray.remote
 def remote_ep(num_pairs, batch_size):
-    """NAS EP: generate Gaussian pairs, bin by floor(r) into 10 radial bins,
-    accumulate sx/sy sums.  Matches MPI master_npb EP_BINS=10 kernel.
-    Returns (t_compute_s, num_pairs, counts[10], sx, sy)."""
+    """NAS EP: Gaussian pairs binned by L∞-norm into 10 radial bins."""
     import time
     import numpy as np
     EP_BINS = 10
     counts = np.zeros(EP_BINS, dtype=np.int64)
-    sx = 0.0
-    sy = 0.0
+    sx = sy = 0.0
     remaining = num_pairs
     t0 = time.perf_counter()
     while remaining > 0:
         n = min(batch_size, remaining)
         xy = np.random.standard_normal((n, 2))
-        # MPI worker_npb.c ep_compute: bin = floor(max(|x|,|y|)), capped at 9.
-        # L∞ norm (Chebyshev), NOT L2 radius — matches the C annular-bin definition.
         lmax = np.maximum(np.abs(xy[:, 0]), np.abs(xy[:, 1]))
         k = np.minimum(lmax.astype(np.intp), EP_BINS - 1)
         for b in range(EP_BINS):
@@ -141,50 +208,200 @@ def remote_ep(num_pairs, batch_size):
     return t, num_pairs, counts, sx, sy
 
 
+@ray.remote(num_cpus=0)
+class StreamBarrier:
+    """Release all n_parties callers at once.
+
+    Async actor: every caller blocks server-side on a shared asyncio.Event, so
+    when the last participant arrives all of them are woken within ~1 ms of
+    each other.  Against a multi-second measurement window that residual skew
+    is negligible, which is what makes an aggregate-bandwidth number
+    meaningful: all N workers are provably in their timed region together."""
+
+    def __init__(self, n_parties):
+        import asyncio
+        self._n_parties = n_parties
+        self._arrived = 0
+        self._event = asyncio.Event()
+
+    async def wait(self):
+        self._arrived += 1
+        if self._arrived >= self._n_parties:
+            self._event.set()
+        await self._event.wait()
+        return True
+
+
 @ray.remote
-def remote_cg(n, nz, niter, shift, b):
-    """
-    NAS CG: conjugate gradient on a sparse SPD matrix.
-    Returns (t_compute_s, ops, converged).
-    """
+def remote_stream_triad(n_elements, alpha, n_warmup, barrier, measure_seconds,
+                        chunk_elems):
+    """STREAM Triad: A = B + alpha*C, sustained over a synchronised window.
+
+    Arrays are allocated once per worker process and reused across calls so
+    all physical pages are resident (no page-fault noise in the timed pass).
+    The Triad is evaluated in cache-resident chunks so it moves exactly the
+    3 arrays of DRAM traffic the byte count assumes (see STREAM_CHUNK_ELEMS).
+    After allocation and n_warmup warm-up Triads, the worker joins `barrier`;
+    all N workers are released simultaneously and then run Triads back-to-back
+    for `measure_seconds`.  Each worker reports its own sustained bandwidth
+    over a window that genuinely overlaps every other worker's.
+
+    Returns (t_elapsed_s, n_iters, checksum)."""
     import time
     import numpy as np
-    import scipy.sparse as sp
-    import scipy.sparse.linalg as spla
 
-    rng = np.random.default_rng(0)
-    cols = rng.integers(0, n, size=(n, nz))
-    ones = np.ones(n * nz, dtype=np.float64)
-    rows = np.repeat(np.arange(n), nz)
-    A = sp.coo_matrix((ones, (rows, cols.ravel())), shape=(n, n)).tocsr()
-    A = A + A.T
-    diag = np.asarray(A.sum(axis=1)).ravel() + shift
-    A = (A + sp.diags(diag)).tocsr()
+    # Module-level cache: allocate once, reuse forever in this worker process.
+    global _stream_B, _stream_C, _stream_A, _stream_init_n
+    try:
+        _stream_init_n
+    except NameError:
+        _stream_init_n = 0
 
+    if _stream_init_n != n_elements:
+        _stream_B = np.random.standard_normal(n_elements)
+        _stream_C = np.random.standard_normal(n_elements)
+        _stream_A = np.empty(n_elements, dtype=np.float64)
+        # Touch every page to ensure physical allocation and TLB population.
+        np.multiply(_stream_C, alpha, out=_stream_A)
+        np.add(_stream_A, _stream_B, out=_stream_A)
+        _stream_init_n = n_elements
+
+    B, C, A = _stream_B, _stream_C, _stream_A
+
+    def triad():
+        """A = B + alpha*C over LLC-resident chunks: 3 array-passes of DRAM
+        traffic, matching the bytes reported by the caller."""
+        for i in range(0, n_elements, chunk_elems):
+            s = slice(i, i + chunk_elems)
+            np.multiply(C[s], alpha, out=A[s])
+            np.add(A[s], B[s], out=A[s])
+
+    for _ in range(n_warmup):
+        triad()
+
+    # Everything above is per-worker setup with highly variable cost; the
+    # barrier absorbs that skew so the timed windows below coincide.
+    ray.get(barrier.wait.remote())
+
+    n_iters = 0
     t0 = time.perf_counter()
-    _x, info = spla.cg(A, b, maxiter=niter, rtol=1e-8)
-    t = time.perf_counter() - t0
+    while True:
+        triad()
+        n_iters += 1
+        t = time.perf_counter() - t0
+        if t >= measure_seconds:
+            break
+    return t, n_iters, float(A[0])  # checksum prevents dead-code elimination
 
-    return t, 2 * A.nnz * niter, info == 0
+
+@ray.remote
+def remote_random_chase(n_elements, n_warmup, n_measured):
+    """Random pointer chasing: traverse a randomised int32 permutation.
+    n_warmup dependent accesses are made outside the timer to warm caches
+    consistently; n_measured accesses are timed. Each access depends on the
+    value read at the previous position (full sequential dependency chain).
+
+    Attempts to use a GCC-compiled C kernel for accuracy. Falls back to a
+    Python loop if gcc is unavailable; in that case absolute latency values
+    include ~50 ns of Python loop overhead per access, but the protected/plain
+    relative comparison remains valid.
+
+    Returns (t_compute_s, end_pos, used_c_kernel)."""
+    import ctypes
+    import os
+    import subprocess
+    import tempfile
+    import time
+
+    import numpy as np
+
+    # In-place shuffle avoids the 512 MiB int64 intermediate from permutation().
+    rng = np.random.default_rng()
+    arr = np.arange(n_elements, dtype=np.int32)
+    rng.shuffle(arr)
+
+    # ── C kernel (accurate clock_gettime timing, no Python overhead) ─────────
+    _CHASE_C = r"""
+#include <stdint.h>
+#include <time.h>
+void chase(int32_t *arr, long n_warmup, long n_measured,
+           long *end_pos, double *elapsed_s) {
+    int32_t pos = 0;
+    for (long i = 0; i < n_warmup; i++) pos = arr[pos];
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (long i = 0; i < n_measured; i++) pos = arr[pos];
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    *end_pos = pos;
+    *elapsed_s = (t1.tv_sec - t0.tv_sec) +
+                 (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+}
+"""
+    c_path  = tempfile.mktemp(suffix=".c")
+    so_path = tempfile.mktemp(suffix=".so")
+    try:
+        with open(c_path, "w") as f:
+            f.write(_CHASE_C)
+        ret = subprocess.run(
+            ["gcc", "-O2", "-shared", "-fPIC", "-o", so_path, c_path],
+            capture_output=True,
+        )
+        if ret.returncode == 0:
+            lib = ctypes.CDLL(so_path)
+            lib.chase.restype = None
+            lib.chase.argtypes = [
+                ctypes.POINTER(ctypes.c_int32),
+                ctypes.c_long, ctypes.c_long,
+                ctypes.POINTER(ctypes.c_long),
+                ctypes.POINTER(ctypes.c_double),
+            ]
+            ptr     = arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+            end_pos = ctypes.c_long(0)
+            elapsed = ctypes.c_double(0.0)
+            lib.chase(ptr, n_warmup, n_measured,
+                      ctypes.byref(end_pos), ctypes.byref(elapsed))
+            return float(elapsed.value), int(end_pos.value), True
+    except Exception:
+        pass
+    finally:
+        for p in (c_path, so_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    # ── Python fallback ───────────────────────────────────────────────────────
+    # Reduce measured count to avoid Ray health-check timeout (~20s limit).
+    # ns/access is the same metric; fewer iterations just reduce averaging.
+    py_measured = min(n_measured, 5_000_000)
+    py_warmup   = min(n_warmup,   500_000)
+    print(
+        f"[warn] remote_random_chase: gcc unavailable; using Python loop "
+        f"({py_measured // 1_000_000}M iters). Absolute latency includes "
+        f"~50 ns/iter Python overhead. Protected/plain comparison is still valid.",
+        file=sys.stderr,
+    )
+    pos = 0
+    for _ in range(py_warmup):
+        pos = int(arr[pos])
+    t0 = time.perf_counter()
+    for _ in range(py_measured):
+        pos = int(arr[pos])
+    t = time.perf_counter() - t0
+    return t, pos, False
 
 
 # ---------------------------------------------------------------------------
-# CG worker actor — holds a persistent row block for distributed SpMV
+# CG actor (holds persistent row block for distributed SpMV)
 # ---------------------------------------------------------------------------
 
 @ray.remote(num_cpus=0)
 class CGWorkerActor:
-    """Holds one row block of A for the distributed strong-scaling CG benchmark.
-    Created once per scaling point (N) so matrix setup is not inside the timed loop,
-    matching MPI where the master distributes the matrix once before all runs."""
+    """Holds one row block of A for distributed strong-scaling CG.
+    Created once per scaling point so matrix setup is outside the timed loop."""
     def __init__(self, n, nz, row_start, row_count):
         import numpy as np
         import scipy.sparse as sp
-        # Matches MPI master_npb.c generate_sparse_matrix(seed=42):
-        #   nz random column indices per row, values uniform in [-1, 1],
-        #   NO symmetrization, NO diagonal shift.
-        # Using numpy RNG seeded at 42 so all actors (same seed) produce
-        # the same global matrix structure that MPI would generate.
         rng = np.random.default_rng(42)
         cols = rng.integers(0, n, size=(n, nz))
         vals = rng.uniform(-1.0, 1.0, size=(n, nz))
@@ -194,24 +411,77 @@ class CGWorkerActor:
         ).tocsr()
         self.A_block = A[row_start:row_start + row_count, :]
         self._nnz = int(self.A_block.nnz)
+        # Preallocated result buffer: scipy's `A @ x` allocates a fresh output
+        # on every multiply, and at these sizes numpy may serve that from
+        # mmap/munmap, whose page-table churn is expensive inside an SEV guest.
+        # MPI writes into a malloc'd buffer once, so we do the same.
+        self._y = np.zeros(row_count, dtype=np.float64)
+        # Raw CSR kernel, bypassing scipy's dispatch and allocation layer.
+        # Private API, so fall back to `A @ x` if it ever moves.
+        try:
+            from scipy.sparse import _sparsetools
+            self._csr_matvec = _sparsetools.csr_matvec
+        except Exception:
+            self._csr_matvec = None
 
     def get_nnz(self):
         return self._nnz
 
-    def spmv(self, x):
-        """y_block = A_block @ x  (matches MPI worker SpMV per CG iteration)."""
+    def uses_raw_kernel(self):
+        return self._csr_matvec is not None
+
+    def spmv(self, x, target_ms, min_reps, max_reps):
+        """Timed SpMV, reported per multiply.
+
+        Two things keep the timer on the kernel rather than on Ray:
+        `x` arrives as a plasma-backed buffer, so it is copied into a private
+        array *before* t0 (otherwise shared-memory access and first-touch page
+        faults land inside the measurement); and the multiply is repeated,
+        because a single SpMV over one row block can be far below the
+        per-call noise floor.  The repetition count is derived from a warm-up
+        multiply so the timed loop runs for about `target_ms` at any class or
+        worker count.  Dividing by it yields the same quantity MPI's
+        t_compute_max_ms reports, with the noise divided by the count.
+
+        Returns (t_per_multiply_s, y, reps_used)."""
         import time
+        import numpy as np
+        # Private writable copy: `x` arrives as a read-only plasma mapping, and
+        # the SpMV gathers from it once per nonzero.  MPI receives x into a
+        # malloc'd buffer, so copying here matches it and keeps shared-memory
+        # access cost out of the kernel measurement.
+        x = np.array(x, dtype=np.float64)
+        A = self.A_block
+        mv = self._csr_matvec
+
+        def one(dst):
+            if mv is None:
+                return A @ x
+            dst.fill(0.0)                     # csr_matvec accumulates into y
+            mv(A.shape[0], A.shape[1], A.indptr, A.indices, A.data, x, dst)
+            return dst
+
+        y = self._y
+        # Warm-up doubles as the calibration sample: fault pages, prime the
+        # kernel, and measure one multiply to size the timed loop.
+        t_warm = time.perf_counter()
+        y = one(y)
+        t_one = time.perf_counter() - t_warm
+
+        reps = int((target_ms / 1000.0) / t_one) if t_one > 0 else max_reps
+        reps = max(min_reps, min(max_reps, reps))
+
         t0 = time.perf_counter()
-        y = self.A_block @ x
-        t = time.perf_counter() - t0
-        return t, y
+        for _ in range(reps):
+            y = one(y)
+        t = (time.perf_counter() - t0) / reps
+        return t, y, reps
 
 
 def _make_cg_actors(n, nz, n_active, worker_node_ids):
-    """Create n_active CGWorkerActors pinned to specific worker nodes."""
     base, rem = divmod(n, n_active)
     row_counts = [base + (1 if i < rem else 0) for i in range(n_active)]
-    row_starts = [sum(row_counts[:i]) for i in range(n_active)]
+    row_starts  = [sum(row_counts[:i]) for i in range(n_active)]
     actors = [
         CGWorkerActor.options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(
@@ -220,371 +490,265 @@ def _make_cg_actors(n, nz, n_active, worker_node_ids):
         ).remote(n, nz, row_starts[i], row_counts[i])
         for i in range(n_active)
     ]
-    ray.get([a.get_nnz.remote() for a in actors])   # wait for matrix init
+    ray.get([a.get_nnz.remote() for a in actors])
     return actors
 
 
 # ---------------------------------------------------------------------------
-# Per-run measurement helpers
+# Per-run dispatch helpers (one call = one complete round across N workers)
 # ---------------------------------------------------------------------------
 
-def _once_dgemm(n):
-    A = np.random.standard_normal((n, n))
-    B = np.random.standard_normal((n, n))
-
-    t0 = time.perf_counter()
-    A_ref = ray.put(A)
-    B_ref = ray.put(B)
-    t_scatter = time.perf_counter() - t0
-
-    t1 = time.perf_counter()
-    t_compute, flops = ray.get(remote_dgemm.remote(A_ref, B_ref))
-    t_round = time.perf_counter() - t1
-
-    return t_scatter, t_round, t_compute, flops
+def _make_dgemm_actors(n_active, worker_node_ids):
+    """Create one DGEMMWorker actor per worker node and wait until all are placed."""
+    actors = [
+        DGEMMWorker.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=worker_node_ids[i], soft=False
+            )
+        ).remote()
+        for i in range(n_active)
+    ]
+    ray.get([a.ready.remote() for a in actors])
+    return actors
 
 
-def _once_ep(num_pairs):
-    # Scatter for EP is trivially small (int argument); measure it anyway
-    # to establish the Ray overhead floor.
-    dummy = np.array([num_pairs], dtype=np.int64)
-    t0 = time.perf_counter()
-    _ref = ray.put(dummy)
-    t_scatter = time.perf_counter() - t0
+def _once_dgemm_actors(m, actors):
+    """Scatter A-blocks + B to persistent DGEMMWorker actors, gather C-blocks.
 
-    t1 = time.perf_counter()
-    t_compute, ops, _count = ray.get(remote_ep.remote(num_pairs, EP_BATCH))
-    t_round = time.perf_counter() - t1
+    t_scatter: all load() acks received — inputs are local on each worker node.
+    t_round:   compute() submission to all C-blocks received — compute + gather.
 
-    return t_scatter, t_round, t_compute, ops
-
-
-def _once_cg(n, nz, niter, shift):
-    b = np.ones(n, dtype=np.float64)
-
-    t0 = time.perf_counter()
-    b_ref = ray.put(b)
-    t_scatter = time.perf_counter() - t0
-
-    t1 = time.perf_counter()
-    t_compute, ops, converged = ray.get(remote_cg.remote(n, nz, niter, shift, b_ref))
-    t_round = time.perf_counter() - t1
-
-    if not converged:
-        print(f"  [warn] CG n={n} did not converge", file=sys.stderr)
-
-    return t_scatter, t_round, t_compute, ops
-
-
-# ---------------------------------------------------------------------------
-# Scaling-study dispatch helpers (N simultaneous tasks, one per worker)
-# ---------------------------------------------------------------------------
-
-def _once_dgemm_n(n, n_active, pg):
-    """Strong-scaling DGEMM: partition A's rows across n_active workers.
-    Matches MPI master_bench: scatter A_block+B to each worker, gather C_block."""
+    Explicit ray.put() + ray_free() is required so we hold handles to the
+    plasma entries.  Passing numpy arrays directly as method arguments creates
+    internal ObjectRefs we cannot free, causing old plasma entries (360 MiB for
+    M=6144) to linger until Ray's GC runs.  On the next iteration those stale
+    entries overlap with fresh ones, pushing plasma usage to 720 MiB and
+    triggering an OOM on 2 GiB workers (plasma store is 614 MiB by default).
+    ray_free() after the load() ack forces immediate eviction."""
     from ray._private.internal_api import free as ray_free
-    strat = PlacementGroupSchedulingStrategy(placement_group=pg)
-
-    A = np.random.standard_normal((n, n))
-    B = np.random.standard_normal((n, n))
-
-    # Distribute rows as evenly as possible; last workers get one extra row if remainder.
-    base, rem = divmod(n, n_active)
+    n_active = len(actors)
+    A = np.random.standard_normal((m, m))
+    B = np.random.standard_normal((m, m))
+    base, rem = divmod(m, n_active)
     row_counts = [base + (1 if i < rem else 0) for i in range(n_active)]
     starts = [sum(row_counts[:i]) for i in range(n_active)]
 
-    t0 = time.perf_counter()
+    # Put B once and each A-block separately so we can free them explicitly.
     B_ref = ray.put(B)
     block_refs = [ray.put(A[starts[i]:starts[i] + row_counts[i], :])
                   for i in range(n_active)]
+    del A, B  # release head-side copies immediately
+
+    # Scatter: deliver inputs to each actor, wait for acks.
+    t0 = time.perf_counter()
+    load_refs = [actors[i].load.remote(block_refs[i], B_ref)
+                 for i in range(n_active)]
+    ray.get(load_refs)
     t_scatter = time.perf_counter() - t0
 
+    # Force eviction from all plasma stores — actors hold heap copies via .copy()
+    # so they no longer reference these plasma objects.
+    ray_free(block_refs + [B_ref])
+
+    # Compute + gather: run matmul on each actor, collect C-blocks.
     t1 = time.perf_counter()
-    refs = [remote_dgemm_block.options(scheduling_strategy=strat).remote(br, B_ref)
-            for br in block_refs]
-    outs = ray.get(refs)   # transfers C_blocks back to head (matches MPI gather)
+    compute_refs = [actor.compute.remote() for actor in actors]
+    outs = ray.get(compute_refs)
     t_round = time.perf_counter() - t1
+    ray_free(compute_refs)  # C-block results are in `outs`; evict from plasma
 
     t_compute = max(r[0] for r in outs)
     total_flops = sum(r[1] for r in outs)
-
-    # Explicitly free all plasma objects so the 32–96 MB of DGEMM matrices are
-    # reclaimed before the next workload (EP/CG) runs.  Without this, evictable
-    # objects stay in the plasma store as physical RAM, causing false OOM kills.
-    ray_free(refs + block_refs + [B_ref])
-
     return t_scatter, t_round, t_compute, total_flops
 
 
-def _once_ep_n(num_pairs, n_active, pg):
-    """Dispatch n_active simultaneous NAS EP tasks.
-    Scatter = task dispatch time (analogous to MPI secure_send of 64-bit seed).
-    Gather payload is tiny (10 int64 counts + 2 floats), matching MPI EP."""
+def _pinned(node_id):
+    """Hard-pin one task to one worker node.
+
+    Replaces PlacementGroupSchedulingStrategy for the stateless workloads.
+    A STRICT_SPREAD placement group guarantees one bundle per node but not
+    *which* nodes, so each campaign got an arbitrary subset of the 13 workers.
+    Since worker i is pinned to physical core i-1 and those cores span several
+    CCDs with separate L3 slices, the subset changed aggregate memory
+    bandwidth between campaigns -- a ~10% SEV-vs-plain swing in STREAM with
+    inconsistent sign, sitting on top of a 0.2-1.5% within-campaign CV.
+    Each worker node has exactly 1 CPU, so hard affinity preserves the
+    one-task-per-node guarantee the placement group provided.
+    """
+    return NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
+
+
+def _once_ep_n(num_pairs, n_active, node_ids):
+    """Dispatch n_active EP tasks simultaneously, one per pinned worker."""
     from ray._private.internal_api import free as ray_free
-    strat = PlacementGroupSchedulingStrategy(placement_group=pg)
     t0 = time.perf_counter()
-    refs = [remote_ep.options(scheduling_strategy=strat).remote(num_pairs, EP_BATCH)
-            for _ in range(n_active)]
+    refs = [remote_ep.options(scheduling_strategy=_pinned(node_ids[i]))
+            .remote(num_pairs, EP_BATCH)
+            for i in range(n_active)]
     t_scatter = time.perf_counter() - t0
     t1 = time.perf_counter()
     outs = ray.get(refs)
     ray_free(refs)
     t_round = time.perf_counter() - t1
     t_compute = max(r[0] for r in outs)
-    total_ops = sum(r[1] for r in outs)   # r[1] = num_pairs per worker
-    return t_scatter, t_round, t_compute, total_ops
+    total_pairs = sum(r[1] for r in outs)
+    return t_scatter, t_round, t_compute, total_pairs
 
 
-def _once_cg_n(actors, n, niter):
-    """Strong-scaling CG: niter rounds of scatter-x / SpMV / gather-y_block.
-    Matches MPI master_npb: one full x scatter + one y_block gather per iteration.
-    ops are computed by the caller as 2*n*nz*niter to match MPI's Mop/s formula."""
+def _once_stream_n(n_elements, alpha, n_warmup, n_active, node_ids,
+                   measure_seconds, chunk_elems):
+    """Dispatch n_active STREAM Triad tasks and measure them concurrently.
+
+    The tasks rendezvous on a barrier after their per-worker setup, then all
+    sustain Triads for `measure_seconds`.  Because the timed windows overlap by
+    construction, summing the bytes each worker actually moved and dividing by
+    the longest window is a true aggregate bandwidth for N concurrent workers.
+
+    The barrier actor is num_cpus=0, so it never competes for a worker's CPU.
+    Exactly n_active tasks are pinned to exactly n_active distinct nodes, so
+    every party can reach the barrier and it cannot deadlock on scheduling."""
+    from ray._private.internal_api import free as ray_free
+    barrier = StreamBarrier.remote(n_active)
+    try:
+        t0 = time.perf_counter()
+        refs = [remote_stream_triad.options(scheduling_strategy=_pinned(node_ids[i]))
+                .remote(n_elements, alpha, n_warmup, barrier, measure_seconds,
+                        chunk_elems)
+                for i in range(n_active)]
+        t_scatter = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        outs = ray.get(refs)
+        ray_free(refs)
+        t_round = time.perf_counter() - t1
+        # Longest measurement window; all windows start together at the barrier.
+        t_compute = max(r[0] for r in outs)
+        # 3 array passes (read B, read C, write A) per Triad, summed over the
+        # Triads each worker actually completed inside the shared window.
+        total_bytes = sum(r[1] for r in outs) * 3 * n_elements * 8
+        return t_scatter, t_round, t_compute, total_bytes
+    finally:
+        ray.kill(barrier)
+
+
+def _once_random_n(n_elements, n_warmup, n_measured, n_active, node_ids):
+    """Dispatch n_active RANDOM tasks simultaneously, one per pinned worker."""
+    from ray._private.internal_api import free as ray_free
+    t0 = time.perf_counter()
+    refs = [remote_random_chase.options(scheduling_strategy=_pinned(node_ids[i]))
+            .remote(n_elements, n_warmup, n_measured)
+            for i in range(n_active)]
+    t_scatter = time.perf_counter() - t0
+    t1 = time.perf_counter()
+    outs = ray.get(refs)
+    ray_free(refs)
+    t_round = time.perf_counter() - t1
+    t_compute = max(r[0] for r in outs)   # slowest worker
+    return t_scatter, t_round, t_compute
+
+
+def _once_cg_n(actors, n, niter, target_ms, min_reps, max_reps):
+    """niter rounds of scatter-x / distributed SpMV / gather-y_block."""
     from ray._private.internal_api import free as ray_free
     x = np.ones(n, dtype=np.float64)
-    t_scatter_total = 0.0
-    t_compute_max_total = 0.0
+    t_scatter_total = t_compute_total = 0.0
     t_start = time.perf_counter()
     for _ in range(niter):
         t0 = time.perf_counter()
         x_ref = ray.put(x)
         t_scatter_total += time.perf_counter() - t0
-        refs = [actor.spmv.remote(x_ref) for actor in actors]
+        refs = [actor.spmv.remote(x_ref, target_ms, min_reps, max_reps)
+                for actor in actors]
         outs = ray.get(refs)
         ray_free([x_ref])
-        t_compute_max_total += max(r[0] for r in outs)
+        t_compute_total += max(r[0] for r in outs)
         y = np.concatenate([r[1] for r in outs])
         norm = float(np.linalg.norm(y))
         if norm > 0:
             x = y / norm
     t_round = time.perf_counter() - t_start
-    return t_scatter_total, t_round, t_compute_max_total
+    return t_scatter_total, t_round, t_compute_total
 
 
 # ---------------------------------------------------------------------------
-# Benchmark runner (repeats → median)
+# CSV output
 # ---------------------------------------------------------------------------
 
-def bench(workload, size, runner, repeat, unit):
-    samples = []
-    for i in range(repeat):
-        print(f"  {workload:5s} {size:10s}  run {i+1}/{repeat}", end="\r", flush=True)
-        samples.append(runner())
-    print()
-
-    med = lambda idx: statistics.median(s[idx] for s in samples)
-    t_scatter = med(0)
-    t_round   = med(1)
-    t_compute = med(2)
-    ops       = samples[0][3]
-
-    t_gather   = max(0.0, t_round - t_compute)
-    scale      = 1e9 if unit == "GFLOPS" else 1e6
-    throughput = ops / t_compute / scale
-
-    return Result(
-        workload=workload,
-        size=size,
-        t_scatter_ms=t_scatter * 1e3,
-        t_round_ms=t_round   * 1e3,
-        t_compute_ms=t_compute * 1e3,
-        t_gather_ms=t_gather  * 1e3,
-        throughput=throughput,
-        unit=unit,
-    )
+SCALING_FIELDS = [
+    "N", "run", "workload", "size",
+    # scatter_ms    : DGEMM: DGEMMWorker.load() wall time — ack means inputs are
+    #                 local on the worker node (true network scatter).
+    #                 EP/STREAM/RANDOM: task-submission time (scalar args only,
+    #                 trivially small).  CG: ray.put(x) local write only.
+    # compute_max_ms: slowest worker's kernel time, actor/function-reported.
+    # noncompute_ms : full_round_ms - compute_max_ms.  DGEMM: ≈ gather transfer
+    #                 (C_block return) + head overhead.  Other workloads: includes
+    #                 Ray scheduling, worker input-fetch, and head overhead.
+    # round_ms      : compute() submission to ray.get() return (excludes scatter).
+    # full_round_ms : scatter_ms + round_ms — true end-to-end wall time.
+    "scatter_ms", "compute_max_ms", "noncompute_ms", "round_ms", "full_round_ms",
+    "throughput", "unit",
+]
 
 
-# ---------------------------------------------------------------------------
-# Enrollment (metric 1)
-# ---------------------------------------------------------------------------
-
-def wait_for_workers(n_workers, timeout, head_ip):
-    t0 = time.perf_counter()
-    print(f"Waiting for {n_workers} CVM worker(s)...", end="", flush=True)
-    while True:
-        alive = [nd for nd in ray.nodes()
-                 if nd["Alive"] and nd["NodeManagerAddress"] != head_ip]
-        if len(alive) >= n_workers:
-            elapsed = time.perf_counter() - t0
-            addrs = ", ".join(nd["NodeManagerAddress"] for nd in alive[:n_workers])
-            print(f" connected [{addrs}].")
-            return elapsed * 1e3
-        if time.perf_counter() - t0 > timeout:
-            print()
-            sys.exit(f"Timed out waiting for {n_workers} worker(s).")
-        time.sleep(0.5)
+def _make_writer(csv_path):
+    if not csv_path:
+        return None, None
+    f = open(csv_path, "w", newline="")
+    w = csv.DictWriter(f, fieldnames=SCALING_FIELDS)
+    w.writeheader()
+    f.flush()
+    return f, w
 
 
-# ---------------------------------------------------------------------------
-# Speedup / efficiency (metric 5)
-# ---------------------------------------------------------------------------
-
-def measure_speedup(n_workers, repeat):
-    """
-    Run DGEMM N=1024 with 1 worker (serial) and then with all N workers
-    (parallel) to compute S(N) and E(N).
-    """
-    if n_workers < 2:
-        return None
-
-    SIZE = 1024
-
-    def serial():
-        A = np.random.standard_normal((SIZE, SIZE))
-        B = np.random.standard_normal((SIZE, SIZE))
-        A_ref = ray.put(A)
-        B_ref = ray.put(B)
-        t0 = time.perf_counter()
-        ray.get(remote_dgemm.remote(A_ref, B_ref))
-        return time.perf_counter() - t0
-
-    def parallel():
-        refs = []
-        for _ in range(n_workers):
-            A = np.random.standard_normal((SIZE, SIZE))
-            B = np.random.standard_normal((SIZE, SIZE))
-            refs.append(remote_dgemm.remote(ray.put(A), ray.put(B)))
-        t0 = time.perf_counter()
-        ray.get(refs)
-        return time.perf_counter() - t0
-
-    t1 = statistics.median(serial() for _ in range(repeat))
-    tN = statistics.median(parallel() for _ in range(repeat))
-
-    speedup    = t1 / tN
-    efficiency = speedup / n_workers
-    return t1 * 1e3, tN * 1e3, speedup, efficiency
-
-
-# ---------------------------------------------------------------------------
-# Output
-# ---------------------------------------------------------------------------
-
-HEADER = (
-    f"{'Workload':<8} {'Size':<10} "
-    f"{'t_scatter':>11} {'t_round':>9} {'t_compute':>11} {'t_gather':>9} "
-    f"{'Throughput':>12}  {'Unit'}"
-)
-SEP = "─" * len(HEADER)
-
-def _fmt(ms):
-    return f"{ms:8.1f} ms"
-
-def print_results(enrollment_ms, results, speedup_row, n_workers):
-    print()
-    print(f"  ┌─ Metric 1 – Enrollment: {enrollment_ms:.0f} ms")
-    print()
-    print("  " + HEADER)
-    print("  " + SEP)
-    for r in results:
-        print(
-            f"  {r.workload:<8} {r.size:<10} "
-            f"  {_fmt(r.t_scatter_ms)} {_fmt(r.t_round_ms)} "
-            f"  {_fmt(r.t_compute_ms)} {_fmt(r.t_gather_ms)} "
-            f"  {r.throughput:10.3f}   {r.unit}"
-        )
-    print()
-    if speedup_row:
-        t1, tN, S, E = speedup_row
-        print(
-            f"  ┌─ Metric 5 – Speedup / efficiency  (DGEMM N=1024, {n_workers} workers)\n"
-            f"  │  T(1)={t1:.1f} ms   T({n_workers})={tN:.1f} ms\n"
-            f"  │  S({n_workers}) = {S:.2f}   E({n_workers}) = {E:.2f}"
-        )
-        print()
-    print(
-        "  Notes:\n"
-        "    t_scatter  = ray.put() of task inputs on the head\n"
-        "    t_round    = remote_fn.remote() → ray.get() (excludes scatter)\n"
-        "    t_compute  = worker self-reported (perf_counter around core compute)\n"
-        "    t_gather   = t_round − t_compute  (queue + object fetch + return path)\n"
-        "    Throughput = ops / t_compute"
-    )
-
-
-def _mpi_size(workload, size):
-    """Normalise size label to match MPI summary format."""
-    if workload == "DGEMM":
-        return size.removeprefix("N=")
-    if workload == "CG":
-        return size.removeprefix("Class ")
-    return size  # EP: "2^24" etc. unchanged
-
-
-def _mpi_unit(unit):
-    return "GFLOP/s" if unit == "GFLOPS" else unit
-
-
-def write_csv(path, enrollment_ms, results, speedup_row, n_workers):
-    # speedup_row covers only DGEMM N=1024; build a lookup for that one entry.
-    speedup_lookup = {}
-    if speedup_row:
-        _t1, _tN, S, E = speedup_row
-        speedup_lookup[("DGEMM", "1024")] = (S, E * 100)
-
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "workload", "size", "N", "enroll_ms",
-            "scatter_ms", "compute_ms", "gather_ms", "scat+gath_ms",
-            "round_ms", "speedup", "effic_%", "throughput", "unit",
-        ])
-        for r in results:
-            size = _mpi_size(r.workload, r.size)
-            scat_gath = r.t_scatter_ms + r.t_gather_ms
-            key = (r.workload, size)
-            if n_workers == 1:
-                speedup_val, effic_val = "1.000", "100.000"
-            elif key in speedup_lookup:
-                S, E = speedup_lookup[key]
-                speedup_val, effic_val = f"{S:.3f}", f"{E:.3f}"
-            else:
-                speedup_val, effic_val = "", ""
-            w.writerow([
-                r.workload,
-                size,
-                n_workers,
-                f"{enrollment_ms:.3f}",
-                f"{r.t_scatter_ms:.3f}",
-                f"{r.t_compute_ms:.3f}",
-                f"{r.t_gather_ms:.3f}",
-                f"{scat_gath:.3f}",
-                f"{r.t_round_ms:.3f}",
-                speedup_val,
-                effic_val,
-                f"{r.throughput:.3f}",
-                _mpi_unit(r.unit),
-            ])
-    print(f"  CSV written to {path}")
+def _emit(writer, f_out, n_active, run_idx, workload, size,
+          t_sc, t_round, t_comp, throughput, unit_str):
+    t_full      = t_sc + t_round          # true end-to-end (scatter + round)
+    noncompute  = max(0.0, t_full - t_comp)
+    row = {
+        "N":               n_active,
+        "run":             run_idx,
+        "workload":        workload,
+        "size":            size,
+        "scatter_ms":      f"{t_sc * 1e3:.3f}",
+        "compute_max_ms":  f"{t_comp * 1e3:.3f}",
+        "noncompute_ms":   f"{noncompute * 1e3:.3f}",
+        "round_ms":        f"{t_round * 1e3:.3f}",
+        "full_round_ms":   f"{t_full * 1e3:.3f}",
+        "throughput":      f"{throughput:.4f}",
+        "unit":            unit_str,
+    }
+    if writer:
+        writer.writerow(row)
+        f_out.flush()
 
 
 # ---------------------------------------------------------------------------
 # Scaling study
 # ---------------------------------------------------------------------------
 
-SCALING_FIELDS = [
-    "N", "run", "workload", "size",
-    "scatter_ms", "round_ms", "compute_ms", "gather_ms", "scat_gath_ms",
-    "throughput", "unit",
-]
-
-
-def run_scaling(scaling_list, runs, head_ip, skip_cg_a, csv_path, timeout, cg_only=False, cg_classes_arg=None):
+def run_scaling(scaling_list, runs, head_ip, csv_path, timeout,
+                workloads=None, cg_classes_arg=None):
     """
     For each N in scaling_list: create a STRICT_SPREAD placement group across
-    N worker nodes, run all workloads `runs` times, write every row to CSV.
-    CVMs stay up for the entire study — no restart between scaling points.
+    N worker nodes, run the selected workloads `runs` times each, write every
+    row to the CSV immediately.
 
-    compute_ms = max worker compute time (matches MPI's t_compute_max_ms).
-    throughput  = total_ops / compute_max (aggregate compute throughput).
+    workloads: set of strings from {"DGEMM","EP","STREAM","RANDOM","CG"}.
+               Defaults to all five.
     """
-    max_n = max(scaling_list)
+    if workloads is None:
+        workloads = {"DGEMM", "EP", "STREAM", "RANDOM", "CG"}
+
     if cg_classes_arg:
         cg_classes = [c.strip() for c in cg_classes_arg.split(",")]
     else:
-        cg_classes = ["S", "W"] + ([] if skip_cg_a else ["A", "B", "C"])
+        # Classes S (n=1400) and W (n=7000) have Ray RPC overhead >> compute
+        # time at most N values; only A (n=14000) and above give stable results.
+        cg_classes = ["A"]
 
-    # Wait for all workers to connect before starting any scaling point.
+    max_n = max(scaling_list)
+
+    # ── Wait for all workers ─────────────────────────────────────────────────
     print(f"Waiting for {max_n} CVM worker(s)...", end="", flush=True)
     t_start = time.perf_counter()
     while True:
@@ -597,94 +761,108 @@ def run_scaling(scaling_list, runs, head_ip, skip_cg_a, csv_path, timeout, cg_on
             print(f"  Enrollment (all {max_n}): {enroll_ms:.0f} ms\n")
             break
         if time.perf_counter() - t_start > timeout:
-            print()
-            sys.exit(f"Timed out after {timeout}s waiting for {max_n} workers")
+            sys.exit(f"\nTimed out after {timeout}s waiting for {max_n} workers")
         time.sleep(0.5)
 
-    f_out = None
-    writer = None
-    if csv_path:
-        f_out = open(csv_path, "w", newline="")
-        writer = csv.DictWriter(f_out, fieldnames=SCALING_FIELDS)
-        writer.writeheader()
-        f_out.flush()
-
-    def emit(n_active, run_idx, workload, size, t_sc, t_round, t_comp, ops, scale, unit_str):
-        t_gather = max(0.0, t_round - t_comp)
-        tp = ops / t_comp / scale if t_comp > 0 else 0.0
-        row = {
-            "N":            n_active,
-            "run":          run_idx,
-            "workload":     workload,
-            "size":         size,
-            "scatter_ms":   f"{t_sc * 1e3:.3f}",
-            "round_ms":     f"{t_round * 1e3:.3f}",
-            "compute_ms":   f"{t_comp * 1e3:.3f}",
-            "gather_ms":    f"{t_gather * 1e3:.3f}",
-            "scat_gath_ms": f"{(t_sc + t_gather) * 1e3:.3f}",
-            "throughput":   f"{tp:.3f}",
-            "unit":         unit_str,
-        }
-        if writer:
-            writer.writerow(row)
-            f_out.flush()
+    f_out, writer = _make_writer(csv_path)
 
     try:
         for n_active in sorted(scaling_list):
-            pg = placement_group(
-                [{"CPU": 1} for _ in range(n_active)],
-                strategy="STRICT_SPREAD",
-            )
-            ray.get(pg.ready(), timeout=60)
-
-            # Worker node IDs for actor placement (head has --num-cpus=0 so excluded).
-            worker_node_ids = sorted(
-                nd["NodeID"] for nd in ray.nodes()
-                if nd["Alive"] and nd["NodeManagerAddress"] != head_ip
-            )[:n_active]
+            # Order by worker IP (192.168.100.<id+1>), NOT by NodeID.  NodeID
+            # is a random hex string, so sorting on it picks an arbitrary
+            # subset of physical workers that differs between campaigns.  Each
+            # worker is pinned to physical core <id-1>, and those cores span
+            # several CCDs with separate L3 slices, so an arbitrary subset
+            # changes aggregate memory bandwidth — which showed up as a ~10%
+            # SEV-vs-plain difference in STREAM with inconsistent sign, on top
+            # of a 0.2-1.5% within-campaign CV.  Sorting by IP makes N=k always
+            # mean workers 1..k in every campaign.
+            worker_node_ids = [
+                nid for _, nid in sorted(
+                    ((nd["NodeManagerAddress"], nd["NodeID"])
+                     for nd in ray.nodes()
+                     if nd["Alive"] and nd["NodeManagerAddress"] != head_ip),
+                    key=lambda t: tuple(int(o) for o in t[0].split("."))
+                )
+            ][:n_active]
 
             print(f"N={n_active:2d}  ", end="", flush=True)
 
-            # DGEMM — all runs, no actors alive during this phase.
-            if not cg_only:
-                for run_idx in range(1, runs + 1):
-                    for n in DGEMM_SIZES:
-                        if n % n_active != 0:
-                            # MPI master_bench.c:790 skips sizes not evenly divisible
-                            continue
-                        t_sc, t_rd, t_cp, flops = _once_dgemm_n(n, n_active, pg)
-                        emit(n_active, run_idx, "DGEMM", str(n),
-                             t_sc, t_rd, t_cp, flops, 1e9, "GFLOP/s")
+            # ── DGEMM ──────────────────────────────────────────────────────
+            # Run first so the worker processes the stateless workloads spawn
+            # (one per node, ~300 MiB each) don't compete with the DGEMMWorker
+            # actors for RAM.  For M=6144 the B-matrix alone is 288 MiB.
+            if "DGEMM" in workloads:
+                for m, valid_ns in sorted(DGEMM_CONFIGS.items()):
+                    if n_active not in valid_ns:
+                        continue
+                    dgemm_actors = _make_dgemm_actors(n_active, worker_node_ids)
+                    for _ in range(2):          # warm-up (not recorded)
+                        _once_dgemm_actors(m, dgemm_actors)
+                    for run_idx in range(1, runs + 1):
+                        t_sc, t_rd, t_cp, flops = _once_dgemm_actors(m, dgemm_actors)
+                        tp = flops / t_cp / 1e9 if t_cp > 0 else 0.0
+                        _emit(writer, f_out, n_active, run_idx,
+                              "DGEMM", str(m), t_sc, t_rd, t_cp, tp, "GFLOP/s")
                     print("d", end="", flush=True)
+                    for actor in dgemm_actors:
+                        ray.kill(actor)
 
-            # EP — all runs, no actors alive during this phase.
-            if not cg_only:
+            # ── EP ─────────────────────────────────────────────────────────
+            if "EP" in workloads:
                 for run_idx in range(1, runs + 1):
                     for pairs in EP_PAIRS:
                         exp = pairs.bit_length() - 1
-                        t_sc, t_rd, t_cp, ops = _once_ep_n(pairs, n_active, pg)
-                        emit(n_active, run_idx, "EP", f"2^{exp}",
-                             t_sc, t_rd, t_cp, ops, 1e6, "Mop/s")
+                        t_sc, t_rd, t_cp, total_p = _once_ep_n(pairs, n_active, worker_node_ids)
+                        tp = total_p / t_cp / 1e6 if t_cp > 0 else 0.0
+                        _emit(writer, f_out, n_active, run_idx,
+                              "EP", f"2^{exp}", t_sc, t_rd, t_cp, tp, "Mop/s")
                     print("e", end="", flush=True)
 
-            # CG — one class at a time so only one actor process/node exists at once.
-            # Three classes alive simultaneously would add ~150 MB/node (3 × Python base),
-            # pushing idle memory above the 95% Ray kill threshold on 1 GB CVMs.
-            for cls in cg_classes:
-                p = CG_CLASSES[cls]
-                actors = _make_cg_actors(
-                    p["n"], p["nz"], n_active, worker_node_ids
-                )
+            # ── STREAM Triad ───────────────────────────────────────────────
+            if "STREAM" in workloads:
                 for run_idx in range(1, runs + 1):
-                    t_sc, t_rd, t_cp = _once_cg_n(actors, p["n"], p["niter"])
-                    ops = 2 * p["n"] * p["nz"] * p["niter"]
-                    emit(n_active, run_idx, "CG", cls,
-                         t_sc, t_rd, t_cp, ops, 1e6, "Mop/s")
-                    print("c", end="", flush=True)
-                for actor in actors:
-                    ray.kill(actor)
+                    t_sc, t_rd, t_cp, total_bytes = _once_stream_n(
+                        STREAM_ARRAY_ELEMS, STREAM_ALPHA, STREAM_WARMUP,
+                        n_active, worker_node_ids, STREAM_MEASURE_SECONDS,
+                        STREAM_CHUNK_ELEMS,
+                    )
+                    tp = total_bytes / t_cp / (1024 ** 3) if t_cp > 0 else 0.0
+                    _emit(writer, f_out, n_active, run_idx,
+                          "STREAM", "128MiB", t_sc, t_rd, t_cp, tp, "GiB/s")
+                    print("s", end="", flush=True)
 
-            remove_placement_group(pg)
+            # ── RANDOM pointer chasing ─────────────────────────────────────
+            if "RANDOM" in workloads:
+                for run_idx in range(1, runs + 1):
+                    t_sc, t_rd, t_cp = _once_random_n(
+                        RANDOM_ARRAY_ELEMS, RANDOM_WARMUP, RANDOM_MEASURED,
+                        n_active, worker_node_ids,
+                    )
+                    # ns/access = slowest worker compute time / accesses
+                    tp = t_cp / RANDOM_MEASURED * 1e9 if t_cp > 0 else 0.0
+                    _emit(writer, f_out, n_active, run_idx,
+                          "RANDOM", "256MiB", t_sc, t_rd, t_cp, tp, "ns/access")
+                    print("r", end="", flush=True)
+
+            # ── CG (one class at a time to limit per-node memory) ──────────
+            if "CG" in workloads:
+                for cls in cg_classes:
+                    p = CG_CLASSES[cls]
+                    actors = _make_cg_actors(p["n"], p["nz"], n_active, worker_node_ids)
+                    for run_idx in range(1, runs + 1):
+                        t_sc, t_rd, t_cp = _once_cg_n(
+                            actors, p["n"], p["niter"],
+                            CG_SPMV_TARGET_MS, CG_SPMV_MIN_REPS,
+                            CG_SPMV_MAX_REPS)
+                        ops = 2 * p["n"] * p["nz"] * p["niter"]
+                        tp = ops / t_cp / 1e6 if t_cp > 0 else 0.0
+                        _emit(writer, f_out, n_active, run_idx,
+                              "CG", cls, t_sc, t_rd, t_cp, tp, "Mop/s")
+                        print("c", end="", flush=True)
+                    for actor in actors:
+                        ray.kill(actor)
+
             print(" ✓")
     finally:
         if f_out:
@@ -696,85 +874,50 @@ def run_scaling(scaling_list, runs, head_ip, skip_cg_a, csv_path, timeout, cg_on
 # ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--repeat",   type=int, default=3,
-                    help="timed repetitions per configuration (default: 3)")
-    ap.add_argument("--timeout",  type=int, default=180,
-                    help="seconds to wait for workers (default: 180)")
-    ap.add_argument("--workers",  type=int, default=1,
-                    help="number of CVM workers expected (default: 1)")
-    ap.add_argument("--skip-cg-a", action="store_true",
-                    help="skip CG Class A (N=14000, can be slow)")
-    ap.add_argument("--cg-only", action="store_true",
-                    help="run only CG workloads, skip EP and DGEMM")
-    ap.add_argument("--cg-classes", metavar="S,W,A,B,C",
-                    help="comma-separated CG classes to run (default: S,W,A,B,C)")
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--timeout",  type=int, default=600,
+                    help="seconds to wait for workers (default: 600)")
     ap.add_argument("--csv",      metavar="FILE",
-                    help="also write results to a CSV file")
-    ap.add_argument("--scaling",  metavar="N1,N2,...",
-                    help="scaling study: comma-separated worker counts, e.g. 1,2,3,...,14; "
-                         "uses Ray placement groups (STRICT_SPREAD); Ray head must have --num-cpus=0")
+                    help="write results to a CSV file")
+    ap.add_argument("--scaling",  metavar="N1,N2,...", required=True,
+                    help="comma-separated worker counts, e.g. 1,2,...,13")
     ap.add_argument("--runs",     type=int, default=10,
-                    help="outer runs per scaling point in --scaling mode (default: 10)")
+                    help="runs per scaling point (default: 10)")
+    ap.add_argument("--workloads", metavar="DGEMM,EP,STREAM,RANDOM,CG",
+                    default="DGEMM,EP,STREAM,RANDOM,CG",
+                    help="comma-separated workloads to run (default: all)")
+    ap.add_argument("--cg-classes", metavar="S,W,A,...",
+                    help="CG classes to run (default: S,W,A)")
+    # Legacy flags kept for backward compatibility with run-scaling-*.sh scripts
+    ap.add_argument("--cg-only", action="store_true",
+                    help="shorthand for --workloads CG")
+    ap.add_argument("--skip-cg-a", action="store_true",
+                    help="remove class A from CG run")
     args = ap.parse_args()
 
     import warnings
-    warnings.filterwarnings("ignore")          # suppress Ray FutureWarning noise
+    warnings.filterwarnings("ignore")
+
+    if args.cg_only:
+        args.workloads = "CG"
+
+    workloads = {w.strip().upper() for w in args.workloads.split(",")}
+
+    cg_classes_arg = args.cg_classes
+    if args.skip_cg_a and not cg_classes_arg:
+        cg_classes_arg = "S,W"
 
     ray.init(address="auto")
-
     head_ip = ray.get_runtime_context().gcs_address.split(":")[0]
 
-    if args.scaling:
-        scaling_list = [int(x.strip()) for x in args.scaling.split(",")]
-        run_scaling(scaling_list, args.runs, head_ip,
-                    args.skip_cg_a, args.csv, args.timeout,
-                    cg_only=args.cg_only, cg_classes_arg=args.cg_classes)
-        ray.shutdown()
-        return
-
-    # Metric 1: enrollment
-    existing = [nd for nd in ray.nodes()
-                if nd["Alive"] and nd["NodeManagerAddress"] != head_ip]
-    if len(existing) >= args.workers:
-        addrs = ", ".join(nd["NodeManagerAddress"] for nd in existing[:args.workers])
-        print(f"Worker(s) already connected [{addrs}]; enrollment time not captured.")
-        enrollment_ms = 0.0
-    else:
-        enrollment_ms = wait_for_workers(args.workers, args.timeout, head_ip)
-
-    results = []
-
-    # DGEMM – metrics 2-6
-    for n in DGEMM_SIZES:
-        results.append(bench("DGEMM", f"N={n}",
-                             lambda n=n: _once_dgemm(n),
-                             args.repeat, "GFLOPS"))
-
-    # EP – metrics 2-6
-    for pairs in EP_PAIRS:
-        exp = pairs.bit_length() - 1
-        results.append(bench("EP", f"2^{exp}",
-                             lambda p=pairs: _once_ep(p),
-                             args.repeat, "Mop/s"))
-
-    # CG – metrics 2-6
-    cg_classes = ["S", "W"] + ([] if args.skip_cg_a else ["A"])
-    for cls in cg_classes:
-        p = CG_CLASSES[cls]
-        results.append(bench("CG", f"Class {cls}",
-                             lambda p=p: _once_cg(**p),
-                             args.repeat, "Mop/s"))
-
-    # Metric 5: speedup / efficiency (only meaningful with >1 worker)
-    speedup_row = measure_speedup(args.workers, args.repeat)
-
-    print_results(enrollment_ms, results, speedup_row, args.workers)
-
-    if args.csv:
-        write_csv(args.csv, enrollment_ms, results, speedup_row, args.workers)
-
+    scaling_list = [int(x.strip()) for x in args.scaling.split(",")]
+    run_scaling(
+        scaling_list, args.runs, head_ip, args.csv, args.timeout,
+        workloads=workloads, cg_classes_arg=cg_classes_arg,
+    )
     ray.shutdown()
 
 
